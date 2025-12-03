@@ -26,7 +26,7 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 
 # Constants
-TOP_N_MINERS = 253  # Number of top emission miners to use for weight calculation
+TOP_N_MINERS = 100  # Number of top emission miners to use for weight calculation
 
 
 def normalize_json_item(item: Dict) -> str:
