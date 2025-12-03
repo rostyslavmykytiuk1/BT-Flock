@@ -1,0 +1,35 @@
+from pathlib import Path
+import bittensor as bt
+from dataclasses import dataclass
+from typing import Optional
+
+ROOT_DIR = Path(__file__).parent.parent
+DECAY_RATE = 1
+MIN_WEIGHT_THRESHOLD = 1e-6
+DEFAULT_RAW_SCORE = 999
+DEFAULT_NORMALIZED_SCORE = 0.0
+DEFAULT_DUPLICATE_COUNT = 100
+
+SCORE_PRECISION = 10_000
+
+
+@dataclass
+class Competition:
+    """Class defining model parameters"""
+    id: str = "1"
+    repo: str = "flock-io/flock-off-s1-character-roleplay"
+    bench: float = 2.60
+    minb: float = 2.40
+    maxb: float = 2.80
+    bheight: float = 0.05
+    pow: int = 2
+    rows: int = 250
+
+    @classmethod
+    def from_defaults(cls) -> "Competition":
+        """Return an instance with constant default values"""
+        return cls()
+
+
+# eval dataset huggingface
+eval_commit = "784fbf1e78d16c512750e3bb5391fa6b338818ae"
