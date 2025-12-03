@@ -152,4 +152,6 @@ backtest/data.jsonl
 backtest/eval_data.jsonl
 backtest/download_log.txt
 backtest/miners_metadata.json
+backtest/miner_data_weights.json
+backtest/row_weights.json
 backtest/hf_datajsonl/
