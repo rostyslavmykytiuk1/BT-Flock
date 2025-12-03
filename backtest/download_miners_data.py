@@ -281,6 +281,8 @@ def build_filename_to_hotkey_mapping(
 
 def main():
     logger = DualLogger(OUTPUT_LOG_FILE)
+    MAX_EMISSION_THRESHOLD = 10.0  # Skip validators with emission > this value
+    
     try:
         config = set_config()
         
@@ -320,13 +322,23 @@ def main():
         
         # Download metadata and data files
         logger.log(f"\n4. Downloading miners' metadata and data files...")
+        logger.log(f"   Skipping validators with emission > {MAX_EMISSION_THRESHOLD}")
         miners_metadata_list = []
         downloaded_count = 0
         skipped_count = 0
+        skipped_high_emission_count = 0
         error_count = 0
         
         for uid_i in current_uids:
             hotkey = metagraph.hotkeys[uid_i]
+            emission = miner_emissions.get(hotkey, 0.0)
+            
+            # Skip validators with emission > 10
+            if emission > MAX_EMISSION_THRESHOLD:
+                skipped_high_emission_count += 1
+                logger.log(f"\n   UID {uid_i} | Hotkey: {hotkey[:16]}... | Emission: {emission:.2f} (SKIPPED - emission > {MAX_EMISSION_THRESHOLD})")
+                continue
+            
             metadata_i = retrieve_model_metadata(subtensor, config.netuid, hotkey)
             
             if metadata_i is None:
@@ -339,7 +351,7 @@ def main():
             filename = f"{safe_repoid}_{safe_revision}.jsonl"
             
             # Download data file
-            logger.log(f"\n   UID {uid_i} | Hotkey: {hotkey[:16]}...")
+            logger.log(f"\n   UID {uid_i} | Hotkey: {hotkey[:16]}... | Emission: {emission:.2f}")
             logger.log(f"   Repo: {metadata_i.id.namespace} @ {metadata_i.id.commit[:16]}...")
             
             download_path = download_datajsonl(
@@ -357,7 +369,7 @@ def main():
                 "competition_id": metadata_i.id.competition_id,
                 "block": int(metadata_i.block),
                 "filename": filename,
-                "emission": miner_emissions.get(hotkey, 0.0),
+                "emission": emission,
                 "downloaded": download_path is not None
             }
             miners_metadata_list.append(miner_info)
@@ -371,6 +383,7 @@ def main():
         
         logger.log(f"\n   Summary:")
         logger.log(f"     Total miners: {len(current_uids)}")
+        logger.log(f"     Skipped (emission > {MAX_EMISSION_THRESHOLD}): {skipped_high_emission_count}")
         logger.log(f"     With metadata: {len(miners_metadata_list)}")
         logger.log(f"     Downloaded: {downloaded_count}")
         logger.log(f"     Errors: {error_count}")
@@ -382,15 +395,31 @@ def main():
             subtensor, config.netuid, BASE_OUT_DIR, logger
         )
         
-        # Prepare final metadata structure
+        # Filter miner_emissions to exclude validators (emission > 10)
+        filtered_miner_emissions = {
+            hotkey: emission 
+            for hotkey, emission in miner_emissions.items() 
+            if emission <= MAX_EMISSION_THRESHOLD
+        }
+        logger.log(f"   Filtered emissions: {len(filtered_miner_emissions)} miners (excluded {len(miner_emissions) - len(filtered_miner_emissions)} validators)")
+        
+        # Filter filename_to_hotkey to exclude validators
+        filtered_filename_to_hotkey = {
+            filename: hotkey
+            for filename, hotkey in filename_to_hotkey.items()
+            if miner_emissions.get(hotkey, 0.0) <= MAX_EMISSION_THRESHOLD
+        }
+        logger.log(f"   Filtered filename mappings: {len(filtered_filename_to_hotkey)} miners (excluded {len(filename_to_hotkey) - len(filtered_filename_to_hotkey)} validators)")
+        
+        # Prepare final metadata structure (only miners, no validators)
         final_metadata = {
             "netuid": config.netuid,
             "block": int(metagraph.block.item() if hasattr(metagraph.block, 'item') else metagraph.block),
             "total_miners": len(current_uids),
             "miners_with_metadata": len(miners_metadata_list),
-            "miner_emissions": miner_emissions,
-            "filename_to_hotkey": filename_to_hotkey,
-            "miners": miners_metadata_list
+            "miner_emissions": filtered_miner_emissions,  # Only miners, no validators
+            "filename_to_hotkey": filtered_filename_to_hotkey,  # Only miners, no validators
+            "miners": miners_metadata_list  # Only miners, no validators
         }
         
         # Save metadata to JSON file
@@ -401,7 +430,7 @@ def main():
         with output_path.open('w', encoding='utf-8') as f:
             json.dump(final_metadata, f, indent=2)
         
-        logger.log(f"   ✓ Saved metadata for {len(miners_metadata_list)} miners")
+        logger.log(f"   ✓ Saved metadata for {len(miners_metadata_list)} miners (validators excluded)")
         
         # Final summary
         logger.log(f"\n" + "=" * 70)
@@ -409,10 +438,12 @@ def main():
         logger.log("=" * 70)
         logger.log(f"NetUID: {config.netuid}")
         logger.log(f"Block: {final_metadata['block']}")
-        logger.log(f"Total miners: {len(current_uids)}")
-        logger.log(f"Miners with metadata: {len(miners_metadata_list)}")
+        logger.log(f"Total UIDs: {len(current_uids)}")
+        logger.log(f"Skipped validators (emission > {MAX_EMISSION_THRESHOLD}): {skipped_high_emission_count}")
+        logger.log(f"Miners in metadata file: {len(miners_metadata_list)}")
         logger.log(f"Data files downloaded: {downloaded_count}")
-        logger.log(f"Filename mappings: {len(filename_to_hotkey)}")
+        logger.log(f"Filename mappings (miners only): {len(filtered_filename_to_hotkey)}")
+        logger.log(f"Miner emissions stored: {len(filtered_miner_emissions)}")
         logger.log(f"Metadata file: {OUTPUT_METADATA_FILE}")
         logger.log(f"Data directory: {BASE_OUT_DIR}")
         logger.log("=" * 70)
