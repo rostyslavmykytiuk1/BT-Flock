@@ -143,7 +143,7 @@ def select_max_weight_rows(
             break
         
         # Apply weight exponentiation for sampling
-        weights_for_sampling = [max(w ** WEIGHT_EXPONENT, 0.01) for _, w, _, _ in available_rows]
+        weights_for_sampling = [max(w ** WEIGHT_EXPONENT, 0.001) for _, w, _, _ in available_rows]
         
         # Weighted random selection from available rows
         selected_idx = rng.choices(range(len(available_rows)), weights=weights_for_sampling, k=1)[0]

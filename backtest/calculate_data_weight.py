@@ -92,6 +92,12 @@ def main():
         default="backtest/row_weights.json",
         help="Path to row weights JSON file (default: backtest/row_weights.json)"
     )
+    parser.add_argument(
+        "--miner-weights",
+        type=str,
+        default="backtest/miner_data_weights.json",
+        help="Path to miner data weights JSON file (from calculate_weights.py) to get expected rank (default: backtest/miner_data_weights.json)"
+    )
     
     args = parser.parse_args()
     
@@ -122,6 +128,34 @@ def main():
     print(f"\n3. Calculating total weight...")
     stats = calculate_data_weight(data, row_weights)
     
+    # Calculate expected rank if miner_weights file exists
+    expected_rank = None
+    total_miners = None
+    if Path(args.miner_weights).exists():
+        print(f"\n4. Calculating expected rank from {args.miner_weights}...")
+        try:
+            with open(args.miner_weights, 'r', encoding='utf-8') as f:
+                miner_weights_data = json.load(f)
+            
+            ranked_miners = miner_weights_data.get('ranked_miners', [])
+            if ranked_miners:
+                # Find where this data weight would rank
+                # Sort all data weights in descending order
+                all_data_weights = [m['data_weight'] for m in ranked_miners]
+                all_data_weights.append(stats['total_weight'])
+                all_data_weights.sort(reverse=True)
+                
+                # Find the rank (1-indexed)
+                expected_rank = all_data_weights.index(stats['total_weight']) + 1
+                total_miners = len(ranked_miners)
+                
+                print(f"   ✓ Found rank information for {total_miners} miners")
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not load miner weights file: {e}")
+    else:
+        print(f"\n4. Miner weights file not found: {args.miner_weights}")
+        print(f"   Skipping rank calculation (run calculate_weights.py first)")
+    
     # Display results
     print(f"\n" + "=" * 70)
     print("WEIGHT STATISTICS")
@@ -133,6 +167,12 @@ def main():
     print(f"Max weight: {stats['max_weight']:.6f}")
     print(f"Rows with weight > 0: {stats['rows_with_weight']}")
     print(f"Rows with weight = 0: {stats['rows_with_zero_weight']}")
+    
+    if expected_rank is not None:
+        print(f"\nExpected Rank: {expected_rank} / {total_miners}")
+        percentile = (1 - (expected_rank - 1) / total_miners) * 100
+        print(f"Percentile: {percentile:.1f}% (better than {expected_rank - 1} out of {total_miners} miners)")
+    
     print("=" * 70)
     
     return 0
