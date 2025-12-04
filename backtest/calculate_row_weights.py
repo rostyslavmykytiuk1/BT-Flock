@@ -26,12 +26,55 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 
 # Constants
-TOP_N_MINERS = 100  # Number of top emission miners to use for weight calculation
+TOP_N_MINERS = 80  # Number of top emission miners to use for weight calculation
+
+# Emission normalization thresholds
+# Emissions below MIN_EMISSION_THRESHOLD are mapped to 0.0
+# Emissions above MAX_EMISSION_THRESHOLD are mapped to 1.0
+# Values in between are linearly interpolated to [0, 1]
+MIN_EMISSION_THRESHOLD = 0.5
+MAX_EMISSION_THRESHOLD = 0.7
 
 
 def normalize_json_item(item: Dict) -> str:
     """Normalize JSON item for comparison (same as validator)."""
     return json.dumps(item, sort_keys=True)
+
+
+def normalize_emission(
+    emission: float,
+    min_threshold: float = MIN_EMISSION_THRESHOLD,
+    max_threshold: float = MAX_EMISSION_THRESHOLD
+) -> float:
+    """
+    Normalize emission value to [0, 1] range using piecewise linear mapping.
+    
+    This expands the narrow emission range (typically 0.55-0.62) to a full [0, 1] range
+    to provide better differentiation when calculating row weights.
+    
+    Args:
+        emission: Raw emission value
+        min_threshold: Emissions below this are mapped to 0.0
+        max_threshold: Emissions above this are mapped to 1.0
+    
+    Returns:
+        Normalized emission in [0, 1] range
+    
+    Formula:
+        - If emission < min_threshold: return 0.0
+        - If emission > max_threshold: return 1.0
+        - Otherwise: linear interpolation: (emission - min_threshold) / (max_threshold - min_threshold)
+    """
+    if emission < min_threshold:
+        return 0.0
+    elif emission > max_threshold:
+        return 1.0
+    else:
+        # Linear interpolation between min_threshold and max_threshold
+        if max_threshold == min_threshold:
+            # Avoid division by zero (shouldn't happen in practice)
+            return 0.5
+        return (emission - min_threshold) / (max_threshold - min_threshold)
 
 
 def load_jsonl(file_path: str) -> List[Dict]:
@@ -58,12 +101,20 @@ def calculate_row_weight(
     miners_dir: str,
     miner_emissions: Dict[str, float],
     filename_to_hotkey: Dict[str, str],
-    top_n: int = TOP_N_MINERS
+    top_n: int = TOP_N_MINERS,
+    min_emission_threshold: float = MIN_EMISSION_THRESHOLD,
+    max_emission_threshold: float = MAX_EMISSION_THRESHOLD
 ) -> Dict[str, float]:
     """
     Calculate weight for each eval_data row based on top N miner emissions.
     
-    For each row, sum up the emissions of all top N miners who use that row.
+    For each row, sum up the normalized emissions of all top N miners who use that row.
+    Emissions are normalized to [0, 1] range using piecewise linear mapping to expand
+    the narrow emission range (typically 0.55-0.62) for better differentiation.
+    
+    Note: These weights are typically used with a power function (e.g., weight^2.5) during
+    selection. The normalization ensures that the full [0, 1] range is utilized, which
+    provides better spread after the power transformation.
     
     Args:
         eval_data: Evaluation dataset
@@ -71,13 +122,16 @@ def calculate_row_weight(
         miner_emissions: Dictionary mapping hotkey -> emission
         filename_to_hotkey: Mapping from filename to hotkey
         top_n: Number of top emission miners to use
+        min_emission_threshold: Emissions below this are normalized to 0.0
+        max_emission_threshold: Emissions above this are normalized to 1.0
     
     Returns:
-        Dictionary mapping normalized row -> weight
+        Dictionary mapping normalized row -> weight (sum of normalized emissions)
     """
     print(f"\n2. Calculating weights for eval_data rows...")
     print(f"   Using top {top_n} miners by emission")
-    print(f"   Weight = sum of emissions from miners who use each row")
+    print(f"   Weight = sum of normalized emissions from miners who use each row")
+    print(f"   Emission normalization: [{min_emission_threshold}, {max_emission_threshold}] → [0, 1]")
     
     # Get top N miners by emission
     sorted_miners = sorted(
@@ -87,10 +141,25 @@ def calculate_row_weight(
     )[:top_n]
     
     top_miners_set = {hotkey for hotkey, _ in sorted_miners}
-    top_miner_emissions = {hotkey: emission for hotkey, emission in sorted_miners}
+    raw_emissions = {hotkey: emission for hotkey, emission in sorted_miners}
+    
+    # Normalize emissions
+    normalized_emissions = {
+        hotkey: normalize_emission(emission, min_emission_threshold, max_emission_threshold)
+        for hotkey, emission in raw_emissions.items()
+    }
     
     print(f"   ✓ Selected top {len(top_miners_set)} miners")
-    print(f"   Emission range: {min(top_miner_emissions.values()):.6f} - {max(top_miner_emissions.values()):.6f}")
+    raw_emission_values = list(raw_emissions.values())
+    normalized_emission_values = list(normalized_emissions.values())
+    print(f"   Raw emission range: {min(raw_emission_values):.6f} - {max(raw_emission_values):.6f}")
+    print(f"   Normalized emission range: {min(normalized_emission_values):.6f} - {max(normalized_emission_values):.6f}")
+    
+    # Count how many emissions were clipped
+    clipped_to_zero = sum(1 for e in raw_emission_values if e < min_emission_threshold)
+    clipped_to_one = sum(1 for e in raw_emission_values if e > max_emission_threshold)
+    in_range = len(raw_emission_values) - clipped_to_zero - clipped_to_one
+    print(f"   Normalization stats: {clipped_to_zero} clipped to 0, {in_range} in range, {clipped_to_one} clipped to 1.0")
     
     # Normalize all eval_data rows
     eval_normalized = {}
@@ -122,14 +191,15 @@ def calculate_row_weight(
         if not miner_data:
             continue
         
-        emission = top_miner_emissions[hotkey]
+        # Use normalized emission instead of raw emission
+        normalized_emission = normalized_emissions[hotkey]
         
-        # For each row in this miner's data, add emission to its weight
+        # For each row in this miner's data, add normalized emission to its weight
         for item in miner_data:
             normalized = normalize_json_item(item)
             if normalized in row_weights:
-                row_weights[normalized] += emission
-                total_emission_added += emission
+                row_weights[normalized] += normalized_emission
+                total_emission_added += normalized_emission
         
         processed += 1
         if processed % 10 == 0:
@@ -325,6 +395,18 @@ def main():
         default="backtest/miner_data_weights.json",
         help="Output file for miner data weights and rankings (default: backtest/miner_data_weights.json)"
     )
+    parser.add_argument(
+        "--min-emission-threshold",
+        type=float,
+        default=MIN_EMISSION_THRESHOLD,
+        help=f"Emissions below this value are normalized to 0.0 (default: {MIN_EMISSION_THRESHOLD})"
+    )
+    parser.add_argument(
+        "--max-emission-threshold",
+        type=float,
+        default=MAX_EMISSION_THRESHOLD,
+        help=f"Emissions above this value are normalized to 1.0 (default: {MAX_EMISSION_THRESHOLD})"
+    )
     
     args = parser.parse_args()
     
@@ -371,7 +453,9 @@ def main():
         args.miners_dir,
         miner_emissions,
         filename_to_hotkey,
-        top_n=args.top_n
+        top_n=args.top_n,
+        min_emission_threshold=args.min_emission_threshold,
+        max_emission_threshold=args.max_emission_threshold
     )
     
     # Save row weights
