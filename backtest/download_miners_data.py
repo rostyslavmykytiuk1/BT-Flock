@@ -303,9 +303,9 @@ def main():
         miner_emissions = get_miner_emissions(subtensor, config.netuid)
         logger.log(f"   ✓ Found emissions for {len(miner_emissions)} miners")
         
-        # Prepare output directory
+        # Prepare output directory - always clear existing files before downloading
         logger.log(f"\n3. Preparing output directory: {BASE_OUT_DIR}")
-        if config.clear_existing and os.path.exists(BASE_OUT_DIR):
+        if os.path.exists(BASE_OUT_DIR):
             logger.log(f"   Clearing existing data...")
             for filename in os.listdir(BASE_OUT_DIR):
                 file_path = os.path.join(BASE_OUT_DIR, filename)
