@@ -67,6 +67,131 @@ def load_miners_data_by_miner(miners_dir: str) -> Dict[str, Set[str]]:
     return miners_data
 
 
+def can_add_row(
+    normalized: str,
+    selected_normalized: Set[str],
+    miner_duplicate_counts: Dict[str, int],
+    miners_data: Dict[str, Set[str]]
+) -> bool:
+    """Check if a row can be added without violating constraints."""
+    if normalized in selected_normalized:
+        return False
+    for miner_file, miner_normalized in miners_data.items():
+        current_dup_count = miner_duplicate_counts[miner_file]
+        if normalized in miner_normalized:
+            if current_dup_count >= MAX_DUPLICATES_PER_MINER:
+                return False
+    return True
+
+
+def calculate_total_weight(selected: List[Dict], row_weights: Dict[str, float]) -> float:
+    """Calculate total weight of selected rows."""
+    return sum(row_weights.get(normalize_json_item(item), 0.0) for item in selected)
+
+
+def local_search_improvement(
+    selected: List[Dict],
+    available_rows: List[tuple],
+    row_weights: Dict[str, float],
+    miners_data: Dict[str, Set[str]],
+    max_iterations: int = 1000
+) -> List[Dict]:
+    """
+    Improve solution using local search: try swapping selected rows with better available rows.
+    
+    Strategy:
+    1. For each selected row, try swapping with available rows that have higher weight
+    2. Accept swap if it improves total weight and maintains constraints
+    3. Repeat until no improvements found or max iterations reached
+    """
+    selected_normalized = {normalize_json_item(item) for item in selected}
+    miner_duplicate_counts = {miner_file: 0 for miner_file in miners_data.keys()}
+    
+    # Initialize duplicate counts
+    for item in selected:
+        normalized = normalize_json_item(item)
+        for miner_file, miner_normalized in miners_data.items():
+            if normalized in miner_normalized:
+                miner_duplicate_counts[miner_file] += 1
+    
+    current_weight = calculate_total_weight(selected, row_weights)
+    improved = True
+    iterations = 0
+    total_improvements = 0
+    
+    while improved and iterations < max_iterations:
+        improved = False
+        iterations += 1
+        
+        # Try swapping each selected row
+        for i, selected_item in enumerate(selected):
+            selected_norm = normalize_json_item(selected_item)
+            selected_weight = row_weights.get(selected_norm, 0.0)
+            
+            # Find best swap candidate
+            best_swap_idx = None
+            best_improvement = 0.0
+            
+            for j, (avail_norm, avail_weight, avail_item, _) in enumerate(available_rows):
+                if avail_norm == selected_norm:
+                    continue
+                
+                # Check if swap would improve weight
+                improvement = avail_weight - selected_weight
+                if improvement <= 0:
+                    continue
+                
+                # Temporarily remove selected row and check if we can add available row
+                for miner_file, miner_normalized in miners_data.items():
+                    if selected_norm in miner_normalized:
+                        miner_duplicate_counts[miner_file] -= 1
+                
+                # Check if available row can be added
+                temp_selected = selected_normalized - {selected_norm}
+                can_add = can_add_row(avail_norm, temp_selected, miner_duplicate_counts, miners_data)
+                
+                # Restore counts
+                for miner_file, miner_normalized in miners_data.items():
+                    if selected_norm in miner_normalized:
+                        miner_duplicate_counts[miner_file] += 1
+                
+                if can_add and improvement > best_improvement:
+                    best_improvement = improvement
+                    best_swap_idx = j
+            
+            # Perform swap if improvement found
+            if best_swap_idx is not None:
+                avail_norm, avail_weight, avail_item, _ = available_rows[best_swap_idx]
+                
+                # Remove old row from counts
+                for miner_file, miner_normalized in miners_data.items():
+                    if selected_norm in miner_normalized:
+                        miner_duplicate_counts[miner_file] -= 1
+                
+                # Add new row to counts
+                for miner_file, miner_normalized in miners_data.items():
+                    if avail_norm in miner_normalized:
+                        miner_duplicate_counts[miner_file] += 1
+                
+                # Update selected list
+                selected[i] = avail_item
+                selected_normalized.remove(selected_norm)
+                selected_normalized.add(avail_norm)
+                
+                # Update available rows (swap the rows)
+                available_rows[best_swap_idx] = (selected_norm, selected_weight, selected_item, 0)
+                
+                current_weight += best_improvement
+                total_improvements += 1
+                improved = True
+                break  # Start over after each improvement
+    
+    if total_improvements > 0:
+        print(f"     Made {total_improvements} improvements in {iterations} iterations")
+    
+    return selected
+
+
 def select_max_weight_rows(
     eval_data: List[Dict],
     row_weights: Dict[str, float],
@@ -75,13 +200,19 @@ def select_max_weight_rows(
     seed: int = None
 ) -> List[Dict]:
     """
-    Select rows using weighted random sampling with weight exponentiation.
+    Select rows using weighted random sampling with local search improvement.
     
     Strategy:
+    Phase 1: Build initial solution using weighted random sampling
     1. Filter rows by minimum weight threshold
     2. Apply weight exponentiation (weight^exp) to favor higher weights
     3. Use weighted random sampling from all available rows
     4. Check duplicates with previous selections and miners' data
+    
+    Phase 2: Improve solution using local search
+    1. Try swapping selected rows with available rows that have higher weight
+    2. Accept swaps that improve total weight while maintaining constraints
+    3. Repeat until no more improvements found
     
     Args:
         eval_data: Full eval dataset
@@ -93,8 +224,9 @@ def select_max_weight_rows(
     Returns:
         List of selected rows
     """
-    print(f"\n2. Selecting {num_rows} rows using weighted random sampling...")
-    print(f"   Strategy: Weight exponentiation (exp={WEIGHT_EXPONENT})")
+    print(f"\n2. Selecting {num_rows} rows using weighted random + local search...")
+    print(f"   Phase 1: Weighted random sampling (exp={WEIGHT_EXPONENT})")
+    print(f"   Phase 2: Local search improvement (swap-based)")
     print(f"   Minimum weight threshold: {MIN_WEIGHT_THRESHOLD}")
     
     # Load miners' data
@@ -134,8 +266,9 @@ def select_max_weight_rows(
     total_weight = 0.0
     max_attempts = num_rows * 100  # Safety limit
     
-    print(f"\n   Starting weighted random selection...")
+    print(f"\n   Phase 1: Building initial solution with weighted random sampling...")
     
+    # Phase 1: Build initial solution using weighted random sampling
     while len(selected) < num_rows and len(available_rows) > 0 and attempts < max_attempts:
         attempts += 1
         
@@ -193,13 +326,42 @@ def select_max_weight_rows(
         print(f"     Skipped (would exceed {MAX_DUPLICATES_PER_MINER} duplicates): {skipped_miner_limit}")
         print(f"     Remaining available rows: {len(available_rows)}")
     
-    print(f"   ✓ Selection complete: {len(selected)} rows selected in {attempts} attempts")
-    print(f"   Total weight: {total_weight:.2f}")
-    print(f"   Average weight per row: {total_weight / len(selected):.2f}" if len(selected) > 0 else "")
+    initial_weight = total_weight
+    print(f"   ✓ Phase 1 complete: {len(selected)} rows selected")
+    print(f"   Initial total weight: {initial_weight:.2f}")
+    print(f"   Average weight per row: {initial_weight / len(selected):.2f}" if len(selected) > 0 else "")
+    
+    # Phase 2: Local search improvement
+    if len(selected) == num_rows:
+        print(f"\n   Phase 2: Improving solution with local search (swap-based)...")
+        # Build list of all available rows (not selected) for swapping
+        all_available = []
+        selected_normalized_set = {normalize_json_item(item) for item in selected}
+        
+        for normalized, weight, item, idx in all_rows:
+            norm = normalize_json_item(item)
+            if norm not in selected_normalized_set:
+                all_available.append((norm, weight, item, idx))
+        
+        selected = local_search_improvement(selected, all_available, row_weights, miners_data)
+        improved_weight = calculate_total_weight(selected, row_weights)
+        improvement = improved_weight - initial_weight
+        print(f"   ✓ Phase 2 complete")
+        print(f"   Improved total weight: {improved_weight:.2f} (+{improvement:.2f})")
+        total_weight = improved_weight
+    else:
+        print(f"   Skipping Phase 2: incomplete initial solution")
     
     # Show duplicate statistics
-    max_dup = max(miner_duplicate_counts.values()) if miner_duplicate_counts else 0
-    miners_with_duplicates = sum(1 for count in miner_duplicate_counts.values() if count > 0)
+    final_miner_duplicate_counts = {miner_file: 0 for miner_file in miners_data.keys()}
+    for item in selected:
+        normalized = normalize_json_item(item)
+        for miner_file, miner_normalized in miners_data.items():
+            if normalized in miner_normalized:
+                final_miner_duplicate_counts[miner_file] += 1
+    
+    max_dup = max(final_miner_duplicate_counts.values()) if final_miner_duplicate_counts else 0
+    miners_with_duplicates = sum(1 for count in final_miner_duplicate_counts.values() if count > 0)
     print(f"   Duplicate statistics:")
     print(f"     Max duplicates with any miner: {max_dup}")
     print(f"     Miners with duplicates: {miners_with_duplicates}/{len(miners_data)}")
