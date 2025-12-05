@@ -18,7 +18,7 @@ import random
 # Selection strategy constants
 MAX_DUPLICATES_PER_MINER = 100  # Skip if adding row would make duplicates >= this
 MIN_WEIGHT_THRESHOLD = 0.0  # Minimum weight to consider (filters out low-quality rows)
-WEIGHT_EXPONENT = 3.0  # Exponent for weight (weight^exp) to favor higher weights
+WEIGHT_EXPONENT = 2.5  # Exponent for weight (weight^exp) to favor higher weights
 
 
 def normalize_json_item(item: Dict) -> str:

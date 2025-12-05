@@ -26,7 +26,7 @@ import numpy as np
 from scipy.stats import spearmanr, pearsonr
 
 # Constants
-TOP_N_MINERS = 80  # Number of top emission miners to use for weight calculation
+TOP_N_MINERS = 100  # Number of top emission miners to use for weight calculation
 
 # Emission normalization thresholds
 # Emissions below MIN_EMISSION_THRESHOLD are mapped to 0.0
