@@ -2,8 +2,12 @@
 """
 Select 250 rows from eval_data to maximize total weight sum.
 
-Uses weighted random sampling where weight = sum of miner emissions.
-Validates duplicates with all miners' data (max 95 duplicates per miner).
+Uses score-based greedy approach:
+- Calculates score = weight^exp / (1 + duplicate_penalty) for each candidate
+- Selects candidate with highest score in each iteration
+- Balances maximizing weight while managing duplicate distribution
+
+Validates duplicates with all miners' data (max 100 duplicates per miner).
 
 Usage:
     python3 backtest/select_max_weight_data.py --weights backtest/row_weights.json --output backtest/data.jsonl
@@ -19,6 +23,9 @@ import random
 MAX_DUPLICATES_PER_MINER = 100  # Skip if adding row would make duplicates >= this
 MIN_WEIGHT_THRESHOLD = 0.0  # Minimum weight to consider (filters out low-quality rows)
 WEIGHT_EXPONENT = 2.5  # Exponent for weight (weight^exp) to favor higher weights
+DUPLICATE_PENALTY_FACTOR = 0.2  # How much to penalize duplicate count (lower = less penalty, prioritize weight)
+DUPLICATE_PENALTY_EXPONENT = 1.2  # Exponent for duplicate penalty (lower = gentler penalty curve)
+ADAPTIVE_PENALTY_THRESHOLD = 0.85  # When normalized_dup > this, reduce penalty impact
 
 
 def normalize_json_item(item: Dict) -> str:
@@ -65,6 +72,118 @@ def load_miners_data_by_miner(miners_dir: str) -> Dict[str, Set[str]]:
     
     print(f"   ✓ Loaded data from {processed} miners")
     return miners_data
+
+
+def calculate_max_duplicate_count(
+    normalized: str,
+    miner_duplicate_counts: Dict[str, int],
+    miners_data: Dict[str, Set[str]]
+) -> int:
+    """
+    Calculate the maximum duplicate count across all miners if we add this row.
+    Only considers miners that currently have less than MAX_DUPLICATES_PER_MINER duplicates.
+    
+    Args:
+        normalized: Normalized row string
+        miner_duplicate_counts: Current duplicate counts per miner
+        miners_data: Dictionary mapping miner_file -> set of normalized items
+    
+    Returns:
+        Maximum duplicate count that would result if this row is added (only from miners < 100)
+    """
+    max_dup = 0
+    for miner_file, miner_normalized in miners_data.items():
+        current_dup_count = miner_duplicate_counts[miner_file]
+        
+        # Only consider miners that have less than MAX_DUPLICATES_PER_MINER duplicates
+        if current_dup_count >= MAX_DUPLICATES_PER_MINER:
+            continue
+        
+        if normalized in miner_normalized:
+            max_dup = max(max_dup, current_dup_count + 1)
+        else:
+            max_dup = max(max_dup, current_dup_count)
+    return max_dup
+
+
+def calculate_row_score(
+    weight: float,
+    max_dup: int,
+    weight_exp: float = WEIGHT_EXPONENT,
+    dup_penalty_factor: float = DUPLICATE_PENALTY_FACTOR,
+    dup_penalty_exp: float = DUPLICATE_PENALTY_EXPONENT,
+    adaptive_threshold: float = ADAPTIVE_PENALTY_THRESHOLD
+) -> float:
+    """
+    Calculate a score for a row that balances weight and duplicate impact.
+    Uses adaptive penalty: when near limit, reduces penalty to prioritize weight.
+    
+    Formula: score = weight^weight_exp / (1 + adaptive_penalty)
+    
+    Higher weight = better
+    Higher max_dup = worse, but penalty is reduced when we're already near limit
+    
+    Args:
+        weight: Row weight
+        max_dup: Maximum duplicate count if this row is added
+        weight_exp: Exponent for weight (higher = favor high weights more)
+        dup_penalty_factor: How much to penalize duplicates
+        dup_penalty_exp: Exponent for duplicate penalty (higher = steeper penalty near limit)
+        adaptive_threshold: When normalized_dup > this, reduce penalty impact
+    
+    Returns:
+        Score value (higher is better)
+    """
+    if weight <= 0:
+        return 0.0
+    
+    # Normalize max_dup to [0, 1] range (0 = no duplicates, 1 = at limit)
+    normalized_dup = min(max_dup / MAX_DUPLICATES_PER_MINER, 1.0)
+    
+    # Adaptive penalty: when we're already at/near the limit, minimize penalty
+    # This allows us to prioritize weight when we're constrained
+    if normalized_dup >= 0.99:
+        # At the limit: essentially ignore penalty, just use weight
+        penalty = 1.01  # Minimal penalty
+    elif normalized_dup > adaptive_threshold:
+        # Near limit: reduce penalty significantly
+        # Linear reduction from full penalty to minimal as we approach limit
+        reduction_ratio = (normalized_dup - adaptive_threshold) / (0.99 - adaptive_threshold)
+        reduction_factor = 1.0 - reduction_ratio * 0.9  # Reduce penalty by up to 90%
+        effective_penalty_factor = dup_penalty_factor * reduction_factor
+        base_penalty = effective_penalty_factor * (normalized_dup ** dup_penalty_exp)
+        penalty = 1.0 + base_penalty
+    else:
+        # Normal range: use full penalty
+        base_penalty = dup_penalty_factor * (normalized_dup ** dup_penalty_exp)
+        penalty = 1.0 + base_penalty
+    
+    # Score = weight^exp / penalty
+    score = (weight ** weight_exp) / penalty
+    
+    return score
+
+
+def calculate_duplicate_impact(
+    normalized: str,
+    miner_duplicate_counts: Dict[str, int],
+    miners_data: Dict[str, Set[str]]
+) -> int:
+    """
+    Calculate how many miners would have their duplicate count increased if we add this row.
+    This helps identify rows that "use up" capacity across many miners.
+    
+    Returns:
+        Number of miners that would get a new duplicate from this row
+    """
+    impact = 0
+    for miner_file, miner_normalized in miners_data.items():
+        current_dup_count = miner_duplicate_counts[miner_file]
+        if current_dup_count >= MAX_DUPLICATES_PER_MINER:
+            continue  # Already at limit, doesn't matter
+        if normalized in miner_normalized:
+            impact += 1
+    return impact
 
 
 def can_add_row(
@@ -132,7 +251,15 @@ def local_search_improvement(
             best_swap_idx = None
             best_improvement = 0.0
             
-            for j, (avail_norm, avail_weight, avail_item, _) in enumerate(available_rows):
+            for j, row_tuple in enumerate(available_rows):
+                if len(row_tuple) == 4:
+                    avail_norm, avail_weight, avail_item, _ = row_tuple
+                else:
+                    # Handle different tuple formats
+                    avail_norm = row_tuple[0]
+                    avail_weight = row_tuple[1]
+                    avail_item = row_tuple[2]
+                
                 if avail_norm == selected_norm:
                     continue
                 
@@ -142,6 +269,7 @@ def local_search_improvement(
                     continue
                 
                 # Temporarily remove selected row and check if we can add available row
+                # Remove selected from counts
                 for miner_file, miner_normalized in miners_data.items():
                     if selected_norm in miner_normalized:
                         miner_duplicate_counts[miner_file] -= 1
@@ -161,7 +289,13 @@ def local_search_improvement(
             
             # Perform swap if improvement found
             if best_swap_idx is not None:
-                avail_norm, avail_weight, avail_item, _ = available_rows[best_swap_idx]
+                row_tuple = available_rows[best_swap_idx]
+                if len(row_tuple) == 4:
+                    avail_norm, avail_weight, avail_item, _ = row_tuple
+                else:
+                    avail_norm = row_tuple[0]
+                    avail_weight = row_tuple[1]
+                    avail_item = row_tuple[2]
                 
                 # Remove old row from counts
                 for miner_file, miner_normalized in miners_data.items():
@@ -179,7 +313,10 @@ def local_search_improvement(
                 selected_normalized.add(avail_norm)
                 
                 # Update available rows (swap the rows)
-                available_rows[best_swap_idx] = (selected_norm, selected_weight, selected_item, 0)
+                if len(row_tuple) == 4:
+                    available_rows[best_swap_idx] = (selected_norm, selected_weight, selected_item, 0)
+                else:
+                    available_rows[best_swap_idx] = (selected_norm, selected_weight, selected_item)
                 
                 current_weight += best_improvement
                 total_improvements += 1
@@ -200,19 +337,12 @@ def select_max_weight_rows(
     seed: int = None
 ) -> List[Dict]:
     """
-    Select rows using weighted random sampling with local search improvement.
+    Select rows using greedy algorithm with local search improvement.
     
-    Strategy:
-    Phase 1: Build initial solution using weighted random sampling
-    1. Filter rows by minimum weight threshold
-    2. Apply weight exponentiation (weight^exp) to favor higher weights
-    3. Use weighted random sampling from all available rows
-    4. Check duplicates with previous selections and miners' data
-    
-    Phase 2: Improve solution using local search
-    1. Try swapping selected rows with available rows that have higher weight
-    2. Accept swaps that improve total weight while maintaining constraints
-    3. Repeat until no more improvements found
+    Strategy (based on research: greedy + local search is effective for constrained optimization):
+    1. Build initial solution using weighted random sampling (good exploration)
+    2. Improve solution using local search: swap selected rows with better available rows
+    3. This combines the exploration of random with the refinement of local search
     
     Args:
         eval_data: Full eval dataset
@@ -224,9 +354,10 @@ def select_max_weight_rows(
     Returns:
         List of selected rows
     """
-    print(f"\n2. Selecting {num_rows} rows using weighted random + local search...")
-    print(f"   Phase 1: Weighted random sampling (exp={WEIGHT_EXPONENT})")
-    print(f"   Phase 2: Local search improvement (swap-based)")
+    print(f"\n2. Selecting {num_rows} rows using greedy + local search...")
+    print(f"   Phase 1: Build initial solution with weighted random sampling")
+    print(f"   Phase 2: Improve solution with local search (swap-based)")
+    print(f"   Weight exponent: {WEIGHT_EXPONENT}")
     print(f"   Minimum weight threshold: {MIN_WEIGHT_THRESHOLD}")
     
     # Load miners' data
@@ -264,56 +395,111 @@ def select_max_weight_rows(
     skipped_duplicate = 0
     skipped_miner_limit = 0
     total_weight = 0.0
-    max_attempts = num_rows * 100  # Safety limit
     
     print(f"\n   Phase 1: Building initial solution with weighted random sampling...")
     
     # Phase 1: Build initial solution using weighted random sampling
-    while len(selected) < num_rows and len(available_rows) > 0 and attempts < max_attempts:
+    while len(selected) < num_rows and len(available_rows) > 0:
         attempts += 1
         
         if len(available_rows) == 0:
             break
         
-        # Apply weight exponentiation for sampling
-        weights_for_sampling = [max(w ** WEIGHT_EXPONENT, 0.001) for _, w, _, _ in available_rows]
+        # Filter available rows: remove duplicates with selected and rows that would exceed limit
+        valid_candidates = []
+        rows_to_remove = []
         
-        # Weighted random selection from available rows
-        selected_idx = rng.choices(range(len(available_rows)), weights=weights_for_sampling, k=1)[0]
-        normalized, weight, item, original_idx = available_rows[selected_idx]
+        for row_tuple in available_rows:
+            normalized, weight, item, original_idx = row_tuple
+            
+            # Check 1: Skip if duplicate with previous selections (permanently invalid)
+            if normalized in selected_normalized:
+                skipped_duplicate += 1
+                rows_to_remove.append(normalized)
+                continue
+            
+            # Check 2: Check if adding this row would cause any miner to have too many duplicates
+            would_exceed = False
+            for miner_file, miner_normalized in miners_data.items():
+                current_dup_count = miner_duplicate_counts[miner_file]
+                if normalized in miner_normalized:
+                    if current_dup_count >= MAX_DUPLICATES_PER_MINER:
+                        would_exceed = True
+                        break
+            
+            if would_exceed:
+                skipped_miner_limit += 1
+                # Don't remove permanently - might become valid later
+                continue
+            
+            valid_candidates.append((normalized, weight, item, original_idx))
         
-        # Check 1: Skip if duplicate with previous selections
-        if normalized in selected_normalized:
-            available_rows.pop(selected_idx)
-            skipped_duplicate += 1
-            continue
+        # Remove permanently invalid rows
+        if rows_to_remove:
+            available_rows = [(n, w, i, idx) for n, w, i, idx in available_rows if n not in rows_to_remove]
         
-        # Check 2: Check if adding this row would cause any miner to have too many duplicates
-        would_exceed = False
-        for miner_file, miner_normalized in miners_data.items():
-            current_dup_count = miner_duplicate_counts[miner_file]
-            if normalized in miner_normalized:
+        if len(valid_candidates) == 0:
+            print(f"   ⚠️  No valid candidates found, stopping...")
+            break
+        
+        # Calculate adaptive probabilities for weighted random sampling
+        # Base probability = weight^exp, then adjust based on capacity constraints
+        selection_weights = []
+        for normalized, weight, item, original_idx in valid_candidates:
+            # Base weight: favor high-weight rows
+            base_weight = max(weight ** WEIGHT_EXPONENT, 0.001)
+            
+            # Adaptive adjustment: boost probability if row doesn't use up much capacity
+            # Calculate average remaining capacity across affected miners
+            total_remaining_capacity = 0
+            affected_miners = 0
+            max_dup_if_added = 0
+            
+            for miner_file, miner_normalized in miners_data.items():
+                current_dup_count = miner_duplicate_counts[miner_file]
                 if current_dup_count >= MAX_DUPLICATES_PER_MINER:
-                    would_exceed = True
-                    break
+                    continue  # Already at limit, doesn't matter
+                
+                if normalized in miner_normalized:
+                    affected_miners += 1
+                    remaining_capacity = MAX_DUPLICATES_PER_MINER - current_dup_count
+                    total_remaining_capacity += remaining_capacity
+                    max_dup_if_added = max(max_dup_if_added, current_dup_count + 1)
+            
+            if affected_miners > 0:
+                avg_remaining_capacity = total_remaining_capacity / affected_miners
+                # Boost probability if there's plenty of capacity (encourage exploration)
+                # Reduce probability if we're near limit (avoid constraint violations)
+                capacity_factor = min(avg_remaining_capacity / 20.0, 1.5)  # Boost up to 1.5x if capacity > 20
+                if max_dup_if_added >= MAX_DUPLICATES_PER_MINER * 0.9:
+                    capacity_factor *= 0.5  # Reduce if near limit
+            else:
+                # Row doesn't create duplicates with any miner - boost it
+                capacity_factor = 1.2
+            
+            # Final selection weight
+            selection_weight = base_weight * capacity_factor
+            selection_weights.append(selection_weight)
         
-        if would_exceed:
-            available_rows.pop(selected_idx)
-            skipped_miner_limit += 1
-            continue
+        # Weighted random selection
+        if len(selection_weights) == 0:
+            break
         
-        # Row is valid - add to selection
-        selected.append(item)
-        selected_normalized.add(normalized)
-        total_weight += weight
+        selected_idx = rng.choices(range(len(valid_candidates)), weights=selection_weights, k=1)[0]
+        best_normalized, best_weight, best_item, best_original_idx = valid_candidates[selected_idx]
+        
+        # Add selected candidate to selection
+        selected.append(best_item)
+        selected_normalized.add(best_normalized)
+        total_weight += best_weight
         
         # Update duplicate counts for miners
         for miner_file, miner_normalized in miners_data.items():
-            if normalized in miner_normalized:
+            if best_normalized in miner_normalized:
                 miner_duplicate_counts[miner_file] += 1
         
-        # Remove from available list
-        available_rows.pop(selected_idx)
+        # Remove selected candidate from available_rows
+        available_rows = [(n, w, i, idx) for n, w, i, idx in available_rows if n != best_normalized]
         
         # Progress update
         if len(selected) % 50 == 0:
@@ -321,7 +507,7 @@ def select_max_weight_rows(
             print(f"     Selected {len(selected)}/{num_rows} rows... (weight: {total_weight:.2f}, max dup: {max_dup})")
     
     if len(selected) < num_rows:
-        print(f"\n   ⚠️  WARNING: Only selected {len(selected)}/{num_rows} rows after {attempts} attempts!")
+        print(f"\n   ⚠️  WARNING: Only selected {len(selected)}/{num_rows} rows after {attempts} iterations!")
         print(f"     Skipped (duplicate with selection): {skipped_duplicate}")
         print(f"     Skipped (would exceed {MAX_DUPLICATES_PER_MINER} duplicates): {skipped_miner_limit}")
         print(f"     Remaining available rows: {len(available_rows)}")
@@ -334,14 +520,16 @@ def select_max_weight_rows(
     # Phase 2: Local search improvement
     if len(selected) == num_rows:
         print(f"\n   Phase 2: Improving solution with local search (swap-based)...")
-        # Build list of all available rows (not selected) for swapping
-        all_available = []
-        selected_normalized_set = {normalize_json_item(item) for item in selected}
-        
+        # Keep track of available rows (those not selected)
+        available_rows_dict = {normalize_json_item(item): (normalize_json_item(item), weight, item, idx) 
+                              for normalized, weight, item, idx in available_rows}
+        # Add all unselected rows to available list for swapping
+        all_available = list(available_rows_dict.values())
         for normalized, weight, item, idx in all_rows:
-            norm = normalize_json_item(item)
-            if norm not in selected_normalized_set:
-                all_available.append((norm, weight, item, idx))
+            if normalize_json_item(item) not in selected_normalized:
+                norm = normalize_json_item(item)
+                if norm not in available_rows_dict:
+                    all_available.append((norm, weight, item, idx))
         
         selected = local_search_improvement(selected, all_available, row_weights, miners_data)
         improved_weight = calculate_total_weight(selected, row_weights)
