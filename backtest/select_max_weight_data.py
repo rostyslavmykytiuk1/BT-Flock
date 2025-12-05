@@ -102,12 +102,8 @@ def local_search_improvement(
     max_iterations: int = 1000
 ) -> List[Dict]:
     """
-    Improve solution using local search: try swapping selected rows with better available rows.
-    
-    Strategy:
-    1. For each selected row, try swapping with available rows that have higher weight
-    2. Accept swap if it improves total weight and maintains constraints
-    3. Repeat until no improvements found or max iterations reached
+    Improve solution using local search (1:1 swaps).
+    Returns improved solution.
     """
     selected_normalized = {normalize_json_item(item) for item in selected}
     
@@ -210,6 +206,139 @@ def local_search_improvement(
         print(f"     No improvements found after {iterations} iterations")
     
     return selected
+
+
+def iterated_local_search(
+    selected: List[Dict],
+    available_rows: List[tuple],
+    row_weights: Dict[str, float],
+    row_to_miners: Dict[str, Set[str]],
+    all_rows: List[tuple],
+    num_restarts: int = 5,
+    kick_size: int = 5
+) -> List[Dict]:
+    """
+    Iterated Local Search with kicks to escape local optima.
+    
+    Strategy:
+    1. Do local search until convergence
+    2. Apply a "kick" - randomly swap kick_size rows (even if worse)
+    3. Do local search again from new state
+    4. Repeat num_restarts times, keeping best solution
+    
+    This explores different regions of solution space and can find better solutions
+    than single local search.
+    """
+    best_selected = selected.copy()
+    best_weight = calculate_total_weight(selected, row_weights)
+    
+    current_selected = selected.copy()
+    current_available = available_rows.copy()
+    
+    print(f"     Starting Iterated Local Search ({num_restarts} restarts, kick_size={kick_size})...")
+    print(f"     Initial weight: {best_weight:.2f}")
+    
+    for restart in range(num_restarts):
+        # Step 1: Local search until convergence
+        print(f"     Restart {restart + 1}/{num_restarts}: Local search...")
+        current_selected = local_search_improvement(
+            current_selected, current_available, row_weights, row_to_miners, max_iterations=500
+        )
+        current_weight = calculate_total_weight(current_selected, row_weights)
+        
+        if current_weight > best_weight:
+            best_selected = current_selected.copy()
+            best_weight = current_weight
+            print(f"       ✓ New best weight: {best_weight:.2f}")
+        
+        # Step 2: Apply "kick" - randomly swap some rows to escape local optimum
+        if restart < num_restarts - 1:  # Don't kick after last restart
+            print(f"       Applying kick (swapping {kick_size} random rows)...")
+            
+            # Rebuild available rows from all_rows (what's not currently selected)
+            # This ensures we have the full set of available rows, not just what was
+            # in the modified available_rows list
+            current_normalized = {normalize_json_item(item) for item in current_selected}
+            current_available = []
+            for norm, weight, item, idx in all_rows:
+                if norm not in current_normalized:
+                    current_available.append((norm, weight, item, idx))
+            
+            # Get all rows (selected + available) for kick
+            all_for_kick = []
+            for item in current_selected:
+                norm = normalize_json_item(item)
+                weight = row_weights.get(norm, 0.0)
+                all_for_kick.append((norm, weight, item, 'selected'))
+            all_for_kick.extend(current_available)
+            
+            # Initialize duplicate counts
+            all_miner_files = set()
+            for miners_set in row_to_miners.values():
+                all_miner_files.update(miners_set)
+            miner_dup_counts = {miner_file: 0 for miner_file in all_miner_files}
+            for item in current_selected:
+                norm = normalize_json_item(item)
+                affected = row_to_miners.get(norm, set())
+                for miner_file in affected:
+                    miner_dup_counts[miner_file] += 1
+            
+            # Try to swap kick_size random selected rows with random available rows
+            import random
+            selected_indices = list(range(len(current_selected)))
+            random.shuffle(selected_indices)
+            kicks_applied = 0
+            
+            for idx in selected_indices[:kick_size]:
+                if len(current_available) == 0:
+                    break
+                
+                selected_item = current_selected[idx]
+                selected_norm = normalize_json_item(selected_item)
+                
+                # Try to find a random available row that can replace it
+                random.shuffle(current_available)
+                for avail_norm, avail_weight, avail_item, _ in current_available:
+                    if avail_norm == selected_norm:
+                        continue
+                    
+                    # Check if swap is valid
+                    selected_affected = row_to_miners.get(selected_norm, set())
+                    for miner_file in selected_affected:
+                        miner_dup_counts[miner_file] -= 1
+                    
+                    temp_selected = current_normalized - {selected_norm}
+                    can_add = can_add_row(avail_norm, temp_selected, miner_dup_counts, row_to_miners)
+                    
+                    for miner_file in selected_affected:
+                        miner_dup_counts[miner_file] += 1
+                    
+                    if can_add:
+                        # Apply kick swap (even if weight is worse)
+                        selected_affected = row_to_miners.get(selected_norm, set())
+                        for miner_file in selected_affected:
+                            miner_dup_counts[miner_file] -= 1
+                        
+                        avail_affected = row_to_miners.get(avail_norm, set())
+                        for miner_file in avail_affected:
+                            miner_dup_counts[miner_file] = miner_dup_counts.get(miner_file, 0) + 1
+                        
+                        current_selected[idx] = avail_item
+                        current_normalized.remove(selected_norm)
+                        current_normalized.add(avail_norm)
+                        
+                        # Update available rows
+                        current_available = [(n, w, i, idx) for n, w, i, idx in current_available if n != avail_norm]
+                        current_available.append((selected_norm, row_weights.get(selected_norm, 0.0), selected_item, 0))
+                        
+                        kicks_applied += 1
+                        break
+            
+            kick_weight = calculate_total_weight(current_selected, row_weights)
+            print(f"       Kick applied: {kicks_applied} swaps, new weight: {kick_weight:.2f} (may be worse)")
+    
+    print(f"     Best weight found: {best_weight:.2f} (improvement: {best_weight - calculate_total_weight(selected, row_weights):.2f})")
+    return best_selected
 
 
 def select_max_weight_rows(
@@ -399,9 +528,9 @@ def select_max_weight_rows(
     print(f"   Initial total weight: {initial_weight:.2f}")
     print(f"   Average weight per row: {initial_weight / len(selected):.2f}" if len(selected) > 0 else "")
     
-    # Phase 2: Local search improvement
+    # Phase 2: Iterated Local Search with kicks
     if len(selected) == num_rows:
-        print(f"\n   Phase 2: Improving solution with local search (swap-based)...")
+        print(f"\n   Phase 2: Improving solution with Iterated Local Search...")
         # Build list of all unselected rows for swapping
         all_available = []
         selected_normalized_set = {normalize_json_item(item) for item in selected}
@@ -410,7 +539,8 @@ def select_max_weight_rows(
             if norm not in selected_normalized_set:
                 all_available.append((norm, weight, item, idx))
         
-        selected = local_search_improvement(selected, all_available, row_weights, row_to_miners)
+        selected = iterated_local_search(selected, all_available, row_weights, row_to_miners, 
+                                        all_rows, num_restarts=5, kick_size=5)
         improved_weight = calculate_total_weight(selected, row_weights)
         improvement = improved_weight - initial_weight
         print(f"   ✓ Phase 2 complete")
