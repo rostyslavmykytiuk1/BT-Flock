@@ -246,6 +246,7 @@ def iterated_local_search(
         )
         current_weight = calculate_total_weight(current_selected, row_weights)
         
+        # CRITICAL: Always check and update best solution after local search
         if current_weight > best_weight:
             best_selected = current_selected.copy()
             best_weight = current_weight
@@ -336,6 +337,21 @@ def iterated_local_search(
             
             kick_weight = calculate_total_weight(current_selected, row_weights)
             print(f"       Kick applied: {kicks_applied} swaps, new weight: {kick_weight:.2f} (may be worse)")
+            
+            # Rebuild current_available after kick for next local search iteration
+            # This ensures available_rows list is correct for the next iteration
+            current_normalized = {normalize_json_item(item) for item in current_selected}
+            current_available = []
+            for norm, weight, item, idx in all_rows:
+                if norm not in current_normalized:
+                    current_available.append((norm, weight, item, idx))
+    
+    # Final check: ensure we return the absolute best solution found
+    final_weight = calculate_total_weight(best_selected, row_weights)
+    if abs(final_weight - best_weight) > 0.01:  # Small tolerance for floating point
+        print(f"     ⚠️  WARNING: Best weight mismatch! best_weight={best_weight:.2f}, final_weight={final_weight:.2f}")
+        # Recalculate to be sure
+        best_weight = final_weight
     
     print(f"     Best weight found: {best_weight:.2f} (improvement: {best_weight - calculate_total_weight(selected, row_weights):.2f})")
     return best_selected

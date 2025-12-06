@@ -256,9 +256,11 @@ def check_all_miners(
             results['miners_above_threshold'] += 1
             results['max_duplicates'] = max(results['max_duplicates'], duplicate_count)
         
-        # Print result
+        # Print result with repository name
         status = "⚠️  WARNING" if is_above_threshold else "✓ OK"
+        repo_full = f"{miner_info['username']}/{miner_info['repo']}"
         print(f"{status} | {miner_info['username']:20} | "
+              f"Repo: {repo_full:40} | "
               f"Duplicates: {duplicate_count:3d} / {len(your_data)} "
               f"({result_entry['duplicate_percentage']:5.1f}%)")
     
@@ -297,7 +299,9 @@ def print_summary(results: Dict):
         
         for i, detail in enumerate(sorted_details, 1):
             threshold_marker = " ⚠️" if detail['above_threshold'] else ""
+            repo_full = f"{detail['miner']}/{detail['repo']}"
             print(f"{i:2d}. {detail['miner']:20} | "
+                  f"Repo: {repo_full:40} | "
                   f"{detail['duplicate_count']:3d} duplicates "
                   f"({detail['duplicate_percentage']:5.1f}%){threshold_marker}")
     
