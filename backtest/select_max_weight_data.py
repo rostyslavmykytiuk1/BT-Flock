@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Set
 import random
+import time
 
 # Selection strategy constants
 MAX_DUPLICATES_PER_MINER = 100  # Skip if adding row would make duplicates >= this
@@ -236,7 +237,7 @@ def iterated_local_search(
     current_available = available_rows.copy()
     
     print(f"     Starting Iterated Local Search ({num_restarts} restarts, kick_size={kick_size})...")
-    print(f"     Initial weight: {best_weight:.2f}")
+    print(f"     Initial weight: {best_weight:.2f}")  
     
     for restart in range(num_restarts):
         # Step 1: Local search until convergence
@@ -422,7 +423,7 @@ def select_max_weight_rows(
             print(f"   ⚠️  Still only {len(available_rows)} rows available!")
     
     # Initialize random number generator
-    rng = random.Random(seed) if seed is not None else random.Random()
+    rng = random.Random(seed or int(time.time()))
     
     # Track selected rows and duplicate counts per miner
     selected = []
@@ -555,8 +556,7 @@ def select_max_weight_rows(
             if norm not in selected_normalized_set:
                 all_available.append((norm, weight, item, idx))
         
-        selected = iterated_local_search(selected, all_available, row_weights, row_to_miners, 
-                                        all_rows, num_restarts=5, kick_size=5)
+        selected = iterated_local_search(selected, all_available, row_weights, row_to_miners, all_rows)
         improved_weight = calculate_total_weight(selected, row_weights)
         improvement = improved_weight - initial_weight
         print(f"   ✓ Phase 2 complete")
@@ -619,8 +619,8 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42)"
+        default=None,
+        help="Random seed for reproducibility (default: None)"
     )
     
     args = parser.parse_args()
