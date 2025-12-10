@@ -152,11 +152,50 @@ def main():
         
         bt.logging.info(f"Using random seed: {lucky_num}")
         
+        # Check environment before training
+        bt.logging.info("=" * 60)
+        bt.logging.info("Environment Check")
+        bt.logging.info("=" * 60)
+        
+        # Check transformers version
+        try:
+            import transformers
+            transformers_version = transformers.__version__
+            bt.logging.info(f"Transformers version: {transformers_version}")
+            # Qwen2.5 models require transformers >= 4.37.0
+            from packaging import version
+            if version.parse(transformers_version) < version.parse("4.37.0"):
+                bt.logging.warning(
+                    f"⚠️  Transformers version {transformers_version} may be too old for Qwen2.5 models. "
+                    f"Recommended: >= 4.37.0"
+                )
+        except Exception as e:
+            bt.logging.warning(f"Could not check transformers version: {e}")
+        
+        # Check GPU availability
+        import torch
+        if torch.cuda.is_available():
+            bt.logging.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+            bt.logging.info(f"CUDA version: {torch.version.cuda}")
+        else:
+            bt.logging.warning("⚠️  CUDA not available - training requires GPU")
+        
+        # Check model configuration
+        try:
+            with open("flockoff/validator/training_args.yaml", "r") as f:
+                import yaml
+                training_args = yaml.safe_load(f)
+                model_key = next(iter(training_args))
+                bt.logging.info(f"Model: {model_key}")
+        except Exception as e:
+            bt.logging.warning(f"Could not read model config: {e}")
+        
+        bt.logging.info("=" * 60)
+        
         # Train and evaluate
-        bt.logging.info("=" * 60)
         bt.logging.info("Starting LoRA training and evaluation...")
-        bt.logging.info("=" * 60)
         bt.logging.info("This may take several minutes depending on your GPU...")
+        bt.logging.info("=" * 60)
         
         raw_score = train_lora(
             lucky_num=lucky_num,
@@ -180,12 +219,25 @@ def main():
             print("benchmark loss as a fallback value. This is NOT a real score.")
             print()
             print("Common causes:")
-            print("  - CUDA/GPU not available (required for training)")
-            print("  - Out of memory")
-            print("  - Model download failed")
-            print("  - Other training errors")
+            print("  1. Model loading error (most common):")
+            print("     - 'Unrecognized model' error usually means:")
+            print("       • The model needs trust_remote_code=True (base code limitation)")
+            print("       • Transformers version may be incompatible")
+            print("       • Model config.json missing model_type field")
             print()
-            print("Please check the error messages above for details.")
+            print("  2. CUDA/GPU not available (required for training)")
+            print("  3. Out of memory")
+            print("  4. Model download failed")
+            print("  5. Other training errors")
+            print()
+            print("Why this happens:")
+            print("  The validator's trainer.py loads models without trust_remote_code=True.")
+            print("  Qwen2.5 models may require this parameter, but since we can't modify")
+            print("  the base code, this error occurs. The validator should handle this")
+            print("  in production, but for local testing, you may need to update the")
+            print("  base trainer.py to add trust_remote_code=True to model loading.")
+            print()
+            print("Please check the error messages above for specific details.")
             print("=" * 60)
             sys.exit(1)
         
