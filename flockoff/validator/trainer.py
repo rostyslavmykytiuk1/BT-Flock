@@ -189,6 +189,7 @@ def train_lora(
             model_key,
             use_fast=True,
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
+            trust_remote_code=True,
         )
 
         model = AutoModelForCausalLM.from_pretrained(
@@ -197,6 +198,7 @@ def train_lora(
             device_map={"": 0},
             token=os.environ["HF_TOKEN"],
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
+            trust_remote_code=True,
         )
 
         # Load dataset
@@ -257,6 +259,7 @@ def train_lora(
             device_map={"": 0},
             token=os.environ["HF_TOKEN"],
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
+            trust_remote_code=True,
         )
         bt.logging.info(f"Loaded eval model")
 
