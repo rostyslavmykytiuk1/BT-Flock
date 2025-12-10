@@ -138,9 +138,7 @@ dmypy.json
 .DS_Store
 Thumbs.db
 
-# data/*
-data
-data/*
+# data
 
 # db 
 scores.db
