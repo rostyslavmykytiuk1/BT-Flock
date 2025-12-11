@@ -190,13 +190,14 @@ def train_lora(
             use_fast=True,
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
             trust_remote_code=True,
+            token=os.environ.get("HF_TOKEN"),
         )
 
         model = AutoModelForCausalLM.from_pretrained(
             model_key,
             quantization_config=bnb_config,
             device_map={"": 0},
-            token=os.environ["HF_TOKEN"],
+            token=os.environ.get("HF_TOKEN"),
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
             trust_remote_code=True,
         )
@@ -257,7 +258,7 @@ def train_lora(
             model_key,
             torch_dtype=torch.bfloat16,
             device_map={"": 0},
-            token=os.environ["HF_TOKEN"],
+            token=os.environ.get("HF_TOKEN"),
             cache_dir=os.path.join(cache_dir, "models") if cache_dir else None,
             trust_remote_code=True,
         )
