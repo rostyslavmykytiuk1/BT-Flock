@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Select 250 rows from eval_data to maximize total weight sum.
+Generate 5 datasets, each containing 250 rows from eval_data to maximize total weight sum.
 
 Uses two-phase approach:
 - Phase 1: Adaptive weighted random sampling with capacity-aware probability adjustments
@@ -8,8 +8,10 @@ Uses two-phase approach:
 
 Validates duplicates with all miners' data (max 100 duplicates per miner).
 
+Each dataset is saved to backtest/generated_data/data_{time_stamp}.jsonl
+
 Usage:
-    python3 backtest/select_max_weight_data.py --weights backtest/row_weights.json --output backtest/data.jsonl
+    python3 backtest/select_max_weight_data.py --weights backtest/row_weights.json
 """
 
 import json
@@ -18,6 +20,7 @@ from pathlib import Path
 from typing import List, Dict, Set
 import random
 import time
+from datetime import datetime
 
 # Selection strategy constants
 MAX_DUPLICATES_PER_MINER = 100  # Skip if adding row would make duplicates >= this
@@ -605,16 +608,16 @@ def main():
         help="Directory with miners' data files (default: backtest/hf_datajsonl)"
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="backtest/data.jsonl",
-        help="Output file path (default: backtest/data.jsonl)"
-    )
-    parser.add_argument(
         "--num-rows",
         type=int,
         default=250,
-        help="Number of rows to select (default: 250)"
+        help="Number of rows to select per dataset (default: 250)"
+    )
+    parser.add_argument(
+        "--num-datasets",
+        type=int,
+        default=5,
+        help="Number of datasets to generate (default: 5)"
     )
     parser.add_argument(
         "--seed",
@@ -648,59 +651,86 @@ def main():
         return 1
     print(f"   ✓ Loaded {len(eval_data):,} rows from eval dataset")
     
-    # Select rows
-    selected = select_max_weight_rows(
-        eval_data,
-        row_weights,
-        args.num_rows,
-        args.miners_dir,
-        seed=args.seed
-    )
+    # Create output directory
+    output_dir = Path("backtest/generated_data")
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Verify no duplicates within selected
-    print(f"\n3. Verifying no duplicates within selected rows...")
-    selected_normalized = set(normalize_json_item(item) for item in selected)
-    if len(selected_normalized) != len(selected):
-        print(f"   ⚠️  WARNING: Found duplicates! Removing...")
-        seen = set()
-        unique_selected = []
-        for item in selected:
-            normalized = normalize_json_item(item)
-            if normalized not in seen:
-                unique_selected.append(item)
-                seen.add(normalized)
-        selected = unique_selected
-        print(f"   ✓ After deduplication: {len(selected)} unique rows")
-    else:
-        print(f"   ✓ No duplicates found")
+    # Generate multiple datasets
+    print(f"\n2. Generating {args.num_datasets} datasets...")
+    all_output_files = []
     
-    # Calculate total weight of selected rows
-    selected_weight = sum(row_weights.get(normalize_json_item(item), 0.0) for item in selected)
-    print(f"   Total weight of selected rows: {selected_weight:.2f}")
-    
-    # Save output
-    print(f"\n4. Saving to {args.output}...")
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with output_path.open('w', encoding='utf-8') as f:
-        for item in selected:
-            f.write(json.dumps(item, ensure_ascii=False) + '\n')
-    
-    print(f"   ✓ Saved {len(selected)} rows")
+    for dataset_num in range(1, args.num_datasets + 1):
+        print(f"\n" + "=" * 70)
+        print(f"GENERATING DATASET {dataset_num}/{args.num_datasets}")
+        print("=" * 70)
+        
+        # Use different seed for each dataset to get variety
+        # If user provided a seed, use it as base and add dataset_num
+        dataset_seed = (args.seed + dataset_num) if args.seed is not None else None
+        
+        # Select rows
+        selected = select_max_weight_rows(
+            eval_data,
+            row_weights,
+            args.num_rows,
+            args.miners_dir,
+            seed=dataset_seed
+        )
+        
+        # Verify no duplicates within selected
+        print(f"\n3. Verifying no duplicates within selected rows...")
+        selected_normalized = set(normalize_json_item(item) for item in selected)
+        if len(selected_normalized) != len(selected):
+            print(f"   ⚠️  WARNING: Found duplicates! Removing...")
+            seen = set()
+            unique_selected = []
+            for item in selected:
+                normalized = normalize_json_item(item)
+                if normalized not in seen:
+                    unique_selected.append(item)
+                    seen.add(normalized)
+            selected = unique_selected
+            print(f"   ✓ After deduplication: {len(selected)} unique rows")
+        else:
+            print(f"   ✓ No duplicates found")
+        
+        # Ensure we have exactly 250 rows
+        if len(selected) != args.num_rows:
+            print(f"   ⚠️  WARNING: Dataset {dataset_num} has {len(selected)} rows, expected {args.num_rows}!")
+        
+        # Calculate total weight of selected rows
+        selected_weight = sum(row_weights.get(normalize_json_item(item), 0.0) for item in selected)
+        print(f"   Total weight of selected rows: {selected_weight:.2f}")
+        
+        # Generate timestamp for output file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_filename = f"data_{timestamp}.jsonl"
+        output_path = output_dir / output_filename
+        
+        # Save output
+        print(f"\n4. Saving dataset {dataset_num} to {output_path}...")
+        with output_path.open('w', encoding='utf-8') as f:
+            for item in selected:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        
+        print(f"   ✓ Saved {len(selected)} rows to {output_path}")
+        all_output_files.append(str(output_path))
+        
+        # Small delay to ensure unique timestamps
+        time.sleep(0.01)
     
     # Final summary
     print(f"\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
     print(f"Eval dataset: {len(eval_data):,} rows")
-    print(f"Rows selected: {len(selected)}")
-    print(f"Total weight: {selected_weight:.2f}")
-    print(f"Output file: {args.output}")
+    print(f"Datasets generated: {args.num_datasets}")
+    print(f"Rows per dataset: {args.num_rows}")
+    print(f"Output directory: {output_dir}")
+    print(f"\nGenerated files:")
+    for i, output_file in enumerate(all_output_files, 1):
+        print(f"  {i}. {output_file}")
     print("=" * 70)
-    
-    if len(selected) < args.num_rows:
-        print(f"\n⚠️  WARNING: Only {len(selected)} rows selected, less than {args.num_rows}!")
     
     return 0
 

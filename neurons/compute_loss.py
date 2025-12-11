@@ -28,8 +28,94 @@ from flockoff.validator.trainer import (
     download_dataset,
 )
 from dotenv import load_dotenv
+from tqdm import tqdm
+from pathlib import Path
 
 load_dotenv()
+
+# Hardcoded dataset paths - update this array with your dataset file paths
+# If this array is empty, the script will auto-discover datasets in backtest/generated_data/
+DATASET_PATHS = [
+    "data/candidates/dataset_000.jsonl",
+    "data/candidates/dataset_001.jsonl",
+]
+
+# Reference points for rank estimation (rank: loss)
+# Lower loss = better rank (rank 1 is best)
+RANK_REFERENCE_POINTS = [
+    (1, 2.414466),
+    (41, 2.416089),
+    (81, 2.416649),
+    (121, 2.416813),
+    (161, 2.416864),
+]
+
+
+def estimate_rank(loss: float) -> int:
+    """
+    Estimate rank based on loss value using linear interpolation between reference points.
+    Lower loss = better rank (rank 1 is best).
+    
+    Args:
+        loss: The loss value to estimate rank for
+        
+    Returns:
+        Estimated rank (integer)
+    """
+    # If loss is better than or equal to rank 1, return rank 1
+    if loss <= RANK_REFERENCE_POINTS[0][1]:
+        return 1
+    
+    # If loss is worse than rank 161, estimate beyond 161
+    if loss >= RANK_REFERENCE_POINTS[-1][1]:
+        # Extrapolate beyond rank 161
+        last_rank, last_loss = RANK_REFERENCE_POINTS[-1]
+        second_last_rank, second_last_loss = RANK_REFERENCE_POINTS[-2]
+        
+        # Calculate slope
+        rank_diff = last_rank - second_last_rank
+        loss_diff = last_loss - second_last_loss
+        
+        if loss_diff > 0:
+            loss_beyond = loss - last_loss
+            rank_increase = int((loss_beyond / loss_diff) * rank_diff)
+            return last_rank + rank_increase
+        else:
+            return last_rank + 1
+    
+    # Find the two reference points the loss falls between
+    for i in range(len(RANK_REFERENCE_POINTS) - 1):
+        rank1, loss1 = RANK_REFERENCE_POINTS[i]
+        rank2, loss2 = RANK_REFERENCE_POINTS[i + 1]
+        
+        if loss1 <= loss <= loss2:
+            # Linear interpolation
+            if loss2 == loss1:
+                return rank1
+            
+            # Interpolate rank
+            loss_ratio = (loss - loss1) / (loss2 - loss1)
+            estimated_rank = rank1 + (rank2 - rank1) * loss_ratio
+            return int(round(estimated_rank))
+    
+    # Fallback (shouldn't reach here)
+    return 161
+
+
+# Auto-discover datasets in backtest/generated_data/ if DATASET_PATHS is empty
+def get_dataset_paths():
+    """Get dataset paths from hardcoded array or auto-discover from generated_data directory."""
+    if DATASET_PATHS:
+        return DATASET_PATHS
+    
+    # Auto-discover from backtest/generated_data/
+    generated_data_dir = Path("backtest/generated_data")
+    if generated_data_dir.exists():
+        dataset_files = sorted(generated_data_dir.glob("data_*.jsonl"))
+        if dataset_files:
+            return [str(f) for f in dataset_files]
+    
+    return []
 
 
 def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_num, base_data_dir=None):
@@ -83,6 +169,7 @@ def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_n
     bt.logging.info(f"Using data directory: {data_dir}")
     
     try:
+        bt.logging.info(f"Starting LoRA training...")
         eval_loss = train_lora(
             lucky_num,
             competition.bench,
@@ -91,7 +178,10 @@ def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_n
             data_dir=data_dir,
             eval_data_dir=eval_data_dir,
         )
-        bt.logging.info(f"Training complete with eval loss: {eval_loss}")
+        bt.logging.info(f"✓ Training complete")
+        bt.logging.info(f"✓ Eval Loss: {eval_loss:.6f}")
+        estimated_rank = estimate_rank(eval_loss)
+        bt.logging.info(f"✓ Estimated Rank: {estimated_rank}")
         return eval_loss, None
     except Exception as e:
         bt.logging.error(f"Training error for {dataset_path}: {e}")
@@ -103,13 +193,6 @@ def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_n
 def main():
     parser = argparse.ArgumentParser(
         description="Compute loss for one or more datasets using the same logic, model, and resources as the validator"
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        nargs='+',
-        required=True,
-        help="Path(s) to the dataset directory or data.jsonl file(s). Can specify multiple paths.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -149,8 +232,24 @@ def main():
         # If that fails, just initialize without config
         bt.logging()
     
+    # Get dataset paths from hardcoded array or auto-discovery
+    dataset_paths = get_dataset_paths()
+    
+    if not dataset_paths:
+        bt.logging.error("No dataset paths found! Please update DATASET_PATHS array in the code or ensure backtest/generated_data/ contains data_*.jsonl files.")
+        return 1
+    
     bt.logging.info("Starting loss computation")
-    bt.logging.info(f"Processing {len(args.dataset_path)} dataset(s)")
+    bt.logging.info(f"Processing {len(dataset_paths)} dataset(s)")
+    
+    # Display reference points for rank estimation
+    print(f"\n{'=' * 60}")
+    print("RANK ESTIMATION REFERENCE POINTS")
+    print(f"{'=' * 60}")
+    print("(Lower loss = better rank)")
+    for rank, loss in RANK_REFERENCE_POINTS:
+        print(f"  Rank {rank}: Loss {loss:.6f}")
+    print(f"{'=' * 60}\n")
 
     # Expand user paths
     if args.cache_dir and args.cache_dir.startswith("~"):
@@ -209,11 +308,19 @@ def main():
         base_data_dir = os.path.expanduser(args.data_dir)
         os.makedirs(base_data_dir, exist_ok=True)
 
-    # Process each dataset
+    # Process each dataset with progress bar
     results = []
-    for i, dataset_path in enumerate(args.dataset_path, 1):
+    output_file = "loss_res.txt"
+    
+    # Initialize progress bar
+    pbar = tqdm(total=len(dataset_paths), desc="Processing datasets", unit="dataset")
+    
+    for i, dataset_path in enumerate(dataset_paths, 1):
+        dataset_filename = os.path.basename(dataset_path)
+        pbar.set_description(f"Processing {dataset_filename}")
+        
         bt.logging.info(f"\n{'=' * 60}")
-        bt.logging.info(f"Processing dataset {i}/{len(args.dataset_path)}: {dataset_path}")
+        bt.logging.info(f"Processing dataset {i}/{len(dataset_paths)}: {dataset_path}")
         bt.logging.info(f"{'=' * 60}")
         
         loss, error = process_dataset(
@@ -225,29 +332,74 @@ def main():
             base_data_dir=base_data_dir,
         )
         
+        # Log eval_loss immediately after processing
+        if error is None:
+            estimated_rank = estimate_rank(loss)
+            print(f"\n{'=' * 60}")
+            print(f"✓ Completed: {dataset_filename}")
+            print(f"  Eval Loss: {loss:.6f}")
+            print(f"  Estimated Rank: {estimated_rank}")
+            print(f"{'=' * 60}")
+            # Update progress bar with eval_loss info
+            pbar.set_postfix({
+                'loss': f"{loss:.6f}",
+                'rank': estimated_rank
+            })
+        else:
+            print(f"\n{'=' * 60}")
+            print(f"✗ Failed: {dataset_filename}")
+            print(f"  Error: {error}")
+            print(f"{'=' * 60}")
+        
         results.append({
             'dataset_path': dataset_path,
+            'dataset_filename': dataset_filename,
             'loss': loss,
             'error': error,
         })
+        
+        # Update progress bar
+        pbar.update(1)
+    
+    pbar.close()
 
-    # Output all results
+    # Output all results to file and console
     print(f"\n{'=' * 60}")
     print(f"RESULTS")
     print(f"{'=' * 60}")
     
     success_count = 0
+    output_lines = []
+    
     for i, result in enumerate(results, 1):
-        print(f"\nDataset {i}: {result['dataset_path']}")
+        filename = result['dataset_filename']
         if result['error'] is None:
-            print(f"  Loss: {result['loss']:.6f}")
+            loss_value = result['loss']
+            estimated_rank = estimate_rank(loss_value)
+            output_line = f"{filename}: {loss_value:.6f}: {estimated_rank}"
+            output_lines.append(output_line)
+            print(f"\nDataset {i}: {filename}")
+            print(f"  Loss: {loss_value:.6f}")
+            print(f"  Estimated Rank: {estimated_rank}")
             success_count += 1
         else:
-            print(f"  Error: {result['error']}")
+            error_msg = result['error']
+            output_line = f"{filename}: ERROR - {error_msg}"
+            output_lines.append(output_line)
+            print(f"\nDataset {i}: {filename}")
+            print(f"  Error: {error_msg}")
     
     print(f"\n{'=' * 60}")
     print(f"Summary: {success_count}/{len(results)} datasets processed successfully")
     print(f"{'=' * 60}\n")
+    
+    # Write results to file (append mode)
+    with open(output_file, 'a', encoding='utf-8') as f:
+        for line in output_lines:
+            f.write(line + '\n')
+    
+    bt.logging.info(f"Results appended to: {output_file}")
+    print(f"Results appended to: {output_file}")
 
     # Cleanup temporary directory if used
     if use_temp:
