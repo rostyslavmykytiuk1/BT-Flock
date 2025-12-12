@@ -20,6 +20,8 @@ import torch
 import random
 import shutil
 import tempfile
+import json
+import numpy as np
 import bittensor as bt
 from flockoff.constants import Competition
 from flockoff import constants
@@ -30,15 +32,9 @@ from flockoff.validator.trainer import (
 from dotenv import load_dotenv
 from tqdm import tqdm
 from pathlib import Path
+from typing import Optional, Dict, List, Tuple
 
 load_dotenv()
-
-# Hardcoded dataset paths - update this array with your dataset file paths
-# If this array is empty, the script will auto-discover datasets in backtest/generated_data/
-DATASET_PATHS = [
-    "data/candidates/dataset_000.jsonl",
-    "data/candidates/dataset_001.jsonl",
-]
 
 # Reference points for rank estimation (rank: loss)
 # Lower loss = better rank (rank 1 is best)
@@ -48,6 +44,17 @@ RANK_REFERENCE_POINTS = [
     (81, 2.416649),
     (121, 2.416813),
     (161, 2.416864),
+]
+
+# Constants
+MINERS_METADATA_FILE = "backtest/miners_metadata.json"
+MINERS_DATA_DIR = "backtest/hf_datajsonl"
+NUM_RUNS_PER_MINER = 3  # Number of times to compute loss with different seeds
+
+# UIDs to process - modify this array directly
+UIDS_TO_PROCESS = [
+    # Add your UIDs here, e.g.:
+    # 1, 2, 3, 4, 5,
 ]
 
 
@@ -102,38 +109,62 @@ def estimate_rank(loss: float) -> int:
     return 161
 
 
-# Auto-discover datasets in backtest/generated_data/ if DATASET_PATHS is empty
-def get_dataset_paths():
-    """Get dataset paths from hardcoded array or auto-discover from generated_data directory."""
-    if DATASET_PATHS:
-        return DATASET_PATHS
+def load_miners_metadata(metadata_file: str) -> Dict:
+    """Load miners metadata from JSON file."""
+    metadata_path = Path(metadata_file)
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Miners metadata file not found: {metadata_file}")
     
-    # Auto-discover from backtest/generated_data/
-    generated_data_dir = Path("backtest/generated_data")
-    if generated_data_dir.exists():
-        dataset_files = sorted(generated_data_dir.glob("data_*.jsonl"))
-        if dataset_files:
-            return [str(f) for f in dataset_files]
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
     
-    return []
+    return metadata
 
 
-def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_num, base_data_dir=None):
-    """Process a single dataset and return the loss."""
+def get_miner_filename(uid: int, metadata: Dict) -> Optional[str]:
+    """Get filename for a miner UID from metadata."""
+    miners = metadata.get('miners', [])
+    for miner in miners:
+        if miner.get('uid') == uid:
+            return miner.get('filename')
+    return None
+
+
+def get_dataset_path_for_uid(uid: int, metadata: Dict, miners_dir: str) -> Optional[str]:
+    """Get full dataset path for a miner UID."""
+    filename = get_miner_filename(uid, metadata)
+    if not filename:
+        return None
+    
+    dataset_path = Path(miners_dir) / filename
+    if dataset_path.exists():
+        return str(dataset_path)
+    return None
+
+
+def process_miner(
+    uid: int,
+    dataset_path: str,
+    eval_data_dir: str,
+    cache_dir: str,
+    competition: Competition,
+    base_data_dir: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Process a single miner's dataset and return the average loss from 3 runs.
+    
+    Returns:
+        (average_loss, error_message)
+    """
     dataset_path = os.path.expanduser(dataset_path)
     
     # Check if dataset path exists
     if not os.path.exists(dataset_path):
-        bt.logging.error(f"Dataset path not found: {dataset_path}")
-        return None, f"Path not found: {dataset_path}"
+        return None, f"Dataset path not found: {dataset_path}"
     
-    # Determine data directory for this dataset
+    # Determine data directory for this miner
     if base_data_dir:
-        # Use a subdirectory based on dataset filename
-        dataset_name = os.path.basename(dataset_path)
-        if dataset_name.endswith(".jsonl"):
-            dataset_name = dataset_name[:-6]  # Remove .jsonl extension
-        data_dir = os.path.join(base_data_dir, dataset_name)
+        data_dir = os.path.join(base_data_dir, f"miner_{uid}")
     else:
         # Use parent directory of dataset path
         if os.path.isfile(dataset_path):
@@ -143,56 +174,78 @@ def process_dataset(dataset_path, eval_data_dir, cache_dir, competition, lucky_n
     
     os.makedirs(data_dir, exist_ok=True)
     
-    # Handle dataset path - if it's a file, copy it to data_dir/data.jsonl
-    # If it's a directory, check for data.jsonl inside
+    # Copy dataset to data_dir/data.jsonl
     if os.path.isfile(dataset_path):
         if dataset_path.endswith(".jsonl"):
             target_path = os.path.join(data_dir, "data.jsonl")
             if dataset_path != target_path:
                 shutil.copy2(dataset_path, target_path)
-                bt.logging.info(f"Copied dataset to: {target_path}")
-            else:
-                bt.logging.info(f"Using dataset at: {target_path}")
         else:
-            bt.logging.error(f"Dataset file must be a .jsonl file: {dataset_path}")
-            return None, f"Invalid file type: {dataset_path}"
+            return None, f"Dataset file must be a .jsonl file: {dataset_path}"
     else:
         # It's a directory, check for data.jsonl
         data_jsonl_path = os.path.join(data_dir, "data.jsonl")
         if not os.path.exists(data_jsonl_path):
-            bt.logging.error(f"data.jsonl not found in directory: {data_dir}")
-            return None, f"data.jsonl not found in: {data_dir}"
-        bt.logging.info(f"Using dataset at: {data_jsonl_path}")
+            return None, f"data.jsonl not found in directory: {data_dir}"
     
-    # Train and evaluate
-    bt.logging.info(f"Starting LoRA training for: {dataset_path}")
-    bt.logging.info(f"Using data directory: {data_dir}")
+    # Run training 3 times with different random seeds
+    losses = []
+    errors = []
     
-    try:
-        bt.logging.info(f"Starting LoRA training...")
-        eval_loss = train_lora(
-            lucky_num,
-            competition.bench,
-            competition.rows,
-            cache_dir=cache_dir,
-            data_dir=data_dir,
-            eval_data_dir=eval_data_dir,
-        )
-        bt.logging.info(f"✓ Training complete")
-        bt.logging.info(f"✓ Eval Loss: {eval_loss:.6f}")
-        estimated_rank = estimate_rank(eval_loss)
-        bt.logging.info(f"✓ Estimated Rank: {estimated_rank}")
-        return eval_loss, None
-    except Exception as e:
-        bt.logging.error(f"Training error for {dataset_path}: {e}")
-        if "CUDA" in str(e):
-            bt.logging.error("CUDA error detected")
-        return None, str(e)
+    for run_num in range(1, NUM_RUNS_PER_MINER + 1):
+        # Generate a different random seed for each run
+        lucky_num = int.from_bytes(os.urandom(4), "little")
+        
+        bt.logging.info(f"  Run {run_num}/{NUM_RUNS_PER_MINER} for UID {uid} (seed: {lucky_num})")
+        
+        try:
+            eval_loss = train_lora(
+                lucky_num,
+                competition.bench,
+                competition.rows,
+                cache_dir=cache_dir,
+                data_dir=data_dir,
+                eval_data_dir=eval_data_dir,
+            )
+            losses.append(eval_loss)
+            bt.logging.info(f"    ✓ Run {run_num} Loss: {eval_loss:.6f}")
+        except Exception as e:
+            error_msg = str(e)
+            errors.append(error_msg)
+            bt.logging.error(f"    ✗ Run {run_num} Error: {error_msg}")
+            if "CUDA" in error_msg:
+                bt.logging.error("    CUDA error detected")
+    
+    # Calculate average if we have at least one successful run
+    if losses:
+        avg_loss = np.mean(losses)
+        bt.logging.info(f"  ✓ UID {uid}: Average loss from {len(losses)}/{NUM_RUNS_PER_MINER} runs: {avg_loss:.6f}")
+        if errors:
+            bt.logging.warning(f"  ⚠️  UID {uid}: {len(errors)} run(s) failed")
+        return avg_loss, None
+    else:
+        # All runs failed
+        error_summary = "; ".join(errors[:3])  # Show first 3 errors
+        if len(errors) > 3:
+            error_summary += f" ... and {len(errors) - 3} more"
+        return None, f"All {NUM_RUNS_PER_MINER} runs failed: {error_summary}"
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute loss for one or more datasets using the same logic, model, and resources as the validator"
+        description="Compute loss for miners by UID using the same logic, model, and resources as the validator"
+    )
+    parser.add_argument(
+        "--metadata-file",
+        type=str,
+        default=MINERS_METADATA_FILE,
+        help=f"Path to miners metadata JSON file (default: {MINERS_METADATA_FILE})",
+    )
+    parser.add_argument(
+        "--miners-dir",
+        type=str,
+        default=MINERS_DATA_DIR,
+        help=f"Directory containing miner data files (default: {MINERS_DATA_DIR})",
     )
     parser.add_argument(
         "--cache-dir",
@@ -210,13 +263,7 @@ def main():
         "--data-dir",
         type=str,
         default=None,
-        help="Base directory to store training data for all datasets (default: temporary directory). Each dataset will use a subdirectory.",
-    )
-    parser.add_argument(
-        "--lucky-num",
-        type=int,
-        default=None,
-        help="Random seed for training (default: random)",
+        help="Base directory to store training data for all miners (default: temporary directory). Each miner will use a subdirectory.",
     )
 
     args = parser.parse_args()
@@ -232,42 +279,33 @@ def main():
         # If that fails, just initialize without config
         bt.logging()
     
-    # Get dataset paths from hardcoded array or auto-discovery
-    dataset_paths = get_dataset_paths()
-    
-    if not dataset_paths:
-        bt.logging.error("No dataset paths found! Please update DATASET_PATHS array in the code or ensure backtest/generated_data/ contains data_*.jsonl files.")
+    # Load miners metadata
+    bt.logging.info(f"Loading miners metadata from: {args.metadata_file}")
+    try:
+        metadata = load_miners_metadata(args.metadata_file)
+    except Exception as e:
+        bt.logging.error(f"Failed to load miners metadata: {e}")
         return 1
     
-    bt.logging.info("Starting loss computation")
-    bt.logging.info(f"Processing {len(dataset_paths)} dataset(s)")
-    
-    # Display reference points for rank estimation
-    print(f"\n{'=' * 60}")
-    print("RANK ESTIMATION REFERENCE POINTS")
-    print(f"{'=' * 60}")
-    print("(Lower loss = better rank)")
-    for rank, loss in RANK_REFERENCE_POINTS:
-        print(f"  Rank {rank}: Loss {loss:.6f}")
-    print(f"{'=' * 60}\n")
-
     # Expand user paths
     if args.cache_dir and args.cache_dir.startswith("~"):
         args.cache_dir = os.path.expanduser(args.cache_dir)
-
     if args.eval_data_dir and args.eval_data_dir.startswith("~"):
         args.eval_data_dir = os.path.expanduser(args.eval_data_dir)
-
+    if args.miners_dir and args.miners_dir.startswith("~"):
+        args.miners_dir = os.path.expanduser(args.miners_dir)
+    
     # Get competition parameters (same as validator)
     competition = Competition.from_defaults()
     eval_namespace = competition.repo
-
+    
     bt.logging.info(f"Competition parameters:")
     bt.logging.info(f"  Benchmark loss: {competition.bench}")
     bt.logging.info(f"  Expected rows: {competition.rows}")
     bt.logging.info(f"  Eval namespace: {eval_namespace}")
-
-    # Download eval dataset once (same as validator) - shared for all datasets
+    bt.logging.info(f"  Runs per miner: {NUM_RUNS_PER_MINER}")
+    
+    # Download eval dataset once (same as validator) - shared for all miners
     eval_data_dir = args.eval_data_dir
     bt.logging.info(
         f"Downloading eval dataset: {eval_namespace}/{constants.eval_commit}"
@@ -286,20 +324,10 @@ def main():
             if src != dst:
                 os.replace(src, dst)
                 bt.logging.info(f"Renamed {fname} → data.jsonl")
-
-    # Generate random seed if not provided (same as validator)
-    if args.lucky_num is None:
-        lucky_num = int.from_bytes(os.urandom(4), "little")
-    else:
-        lucky_num = args.lucky_num
-
-    bt.logging.info(f"Using random seed: {lucky_num}")
-
+    
     # Set up GPU (same as validator.py)
-    # Note: trainer.py sets deterministic=True when imported, but we override benchmark
-    # to match validator.py behavior
     torch.backends.cudnn.benchmark = True
-
+    
     # Determine base data directory
     use_temp = args.data_dir is None
     if use_temp:
@@ -309,51 +337,82 @@ def main():
     else:
         base_data_dir = os.path.expanduser(args.data_dir)
         os.makedirs(base_data_dir, exist_ok=True)
-
-    # Process each dataset with progress bar
+    
+    # Validate UIDs and find dataset paths
+    miner_tasks = []
+    for uid in UIDS_TO_PROCESS:
+        dataset_path = get_dataset_path_for_uid(uid, metadata, args.miners_dir)
+        if dataset_path:
+            miner_tasks.append((uid, dataset_path))
+            bt.logging.info(f"✓ UID {uid}: Found dataset at {dataset_path}")
+        else:
+            filename = get_miner_filename(uid, metadata)
+            if filename:
+                bt.logging.warning(f"✗ UID {uid}: Filename '{filename}' found in metadata but file not found in {args.miners_dir}")
+            else:
+                bt.logging.warning(f"✗ UID {uid}: Not found in miners metadata")
+    
+    if not miner_tasks:
+        bt.logging.error("No valid miners found! Please check UIDs and ensure data files exist.")
+        return 1
+    
+    bt.logging.info(f"Processing {len(miner_tasks)} miner(s)")
+    
+    # Display reference points for rank estimation
+    print(f"\n{'=' * 60}")
+    print("RANK ESTIMATION REFERENCE POINTS")
+    print(f"{'=' * 60}")
+    print("(Lower loss = better rank)")
+    for rank, loss in RANK_REFERENCE_POINTS:
+        print(f"  Rank {rank}: Loss {loss:.6f}")
+    print(f"{'=' * 60}\n")
+    
+    # Process each miner with progress bar
     results = []
     output_file = "loss_res.txt"
     
     # Initialize progress bar
-    pbar = tqdm(total=len(dataset_paths), desc="Processing datasets", unit="dataset")
+    pbar = tqdm(total=len(miner_tasks), desc="Processing miners", unit="miner")
     
-    for i, dataset_path in enumerate(dataset_paths, 1):
+    for i, (uid, dataset_path) in enumerate(miner_tasks, 1):
         dataset_filename = os.path.basename(dataset_path)
-        pbar.set_description(f"Processing {dataset_filename}")
+        pbar.set_description(f"Processing UID {uid}")
         
         bt.logging.info(f"\n{'=' * 60}")
-        bt.logging.info(f"Processing dataset {i}/{len(dataset_paths)}: {dataset_path}")
+        bt.logging.info(f"Processing miner {i}/{len(miner_tasks)}: UID {uid}")
+        bt.logging.info(f"Dataset: {dataset_filename}")
         bt.logging.info(f"{'=' * 60}")
         
-        loss, error = process_dataset(
+        loss, error = process_miner(
+            uid=uid,
             dataset_path=dataset_path,
             eval_data_dir=eval_data_dir,
             cache_dir=args.cache_dir,
             competition=competition,
-            lucky_num=lucky_num,
             base_data_dir=base_data_dir,
         )
         
-        # Log eval_loss immediately after processing
+        # Log results immediately after processing
         if error is None:
             estimated_rank = estimate_rank(loss)
             print(f"\n{'=' * 60}")
-            print(f"✓ Completed: {dataset_filename}")
-            print(f"  Eval Loss: {loss:.6f}")
+            print(f"✓ Completed: UID {uid} ({dataset_filename})")
+            print(f"  Average Loss: {loss:.6f}")
             print(f"  Estimated Rank: {estimated_rank}")
             print(f"{'=' * 60}")
-            # Update progress bar with eval_loss info
+            # Update progress bar
             pbar.set_postfix({
                 'loss': f"{loss:.6f}",
                 'rank': estimated_rank
             })
         else:
             print(f"\n{'=' * 60}")
-            print(f"✗ Failed: {dataset_filename}")
+            print(f"✗ Failed: UID {uid} ({dataset_filename})")
             print(f"  Error: {error}")
             print(f"{'=' * 60}")
         
         results.append({
+            'uid': uid,
             'dataset_path': dataset_path,
             'dataset_filename': dataset_filename,
             'loss': loss,
@@ -364,7 +423,7 @@ def main():
         pbar.update(1)
     
     pbar.close()
-
+    
     # Output all results to file and console
     print(f"\n{'=' * 60}")
     print(f"RESULTS")
@@ -374,25 +433,26 @@ def main():
     output_lines = []
     
     for i, result in enumerate(results, 1):
+        uid = result['uid']
         filename = result['dataset_filename']
         if result['error'] is None:
             loss_value = result['loss']
             estimated_rank = estimate_rank(loss_value)
-            output_line = f"{filename}: {loss_value:.6f}: {estimated_rank}"
+            output_line = f"UID {uid} ({filename}): {loss_value:.6f}: {estimated_rank}"
             output_lines.append(output_line)
-            print(f"\nDataset {i}: {filename}")
-            print(f"  Loss: {loss_value:.6f}")
+            print(f"\nMiner {i}: UID {uid} ({filename})")
+            print(f"  Average Loss: {loss_value:.6f}")
             print(f"  Estimated Rank: {estimated_rank}")
             success_count += 1
         else:
             error_msg = result['error']
-            output_line = f"{filename}: ERROR - {error_msg}"
+            output_line = f"UID {uid} ({filename}): ERROR - {error_msg}"
             output_lines.append(output_line)
-            print(f"\nDataset {i}: {filename}")
+            print(f"\nMiner {i}: UID {uid} ({filename})")
             print(f"  Error: {error_msg}")
     
     print(f"\n{'=' * 60}")
-    print(f"Summary: {success_count}/{len(results)} datasets processed successfully")
+    print(f"Summary: {success_count}/{len(results)} miners processed successfully")
     print(f"{'=' * 60}\n")
     
     # Write results to file (append mode)
@@ -402,12 +462,12 @@ def main():
     
     bt.logging.info(f"Results appended to: {output_file}")
     print(f"Results appended to: {output_file}")
-
+    
     # Cleanup temporary directory if used
     if use_temp:
         bt.logging.info(f"Cleaning up temporary directory: {temp_base}")
         shutil.rmtree(temp_base, ignore_errors=True)
-
+    
     # Return 0 if all succeeded, 1 if any failed
     return 0 if success_count == len(results) else 1
 
