@@ -150,3 +150,5 @@ backtest/data.jsonl
 backtest/download_log.txt
 backtest/miner_data_weights.json
 backtest/hf_datajsonl/
+
+backtest/generated_data/

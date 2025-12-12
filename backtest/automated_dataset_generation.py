@@ -8,7 +8,7 @@ This script combines:
 3. Generate one top dataset with 250 rows (from select_max_weight_data.py)
 4. Calculate eval loss (from compute_loss.py)
 5. Send results to Discord webhook
-6. Loop if rank > 60, stop if rank <= 60
+6. Runs forever, continuously generating datasets and reporting results
 
 Usage:
     python3 backtest/automated_dataset_generation.py --netuid 96
@@ -428,8 +428,8 @@ def main():
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=10,
-        help="Maximum number of iterations (default: 10)",
+        default=None,
+        help="Maximum number of iterations (default: None, runs forever)",
     )
     bt.subtensor.add_args(parser)
     bt.logging.add_args(parser)
@@ -500,10 +500,15 @@ def main():
     torch.backends.cudnn.benchmark = True
     
     iteration = 0
-    while iteration < args.max_iterations:
+    while True:
+        if args.max_iterations and iteration >= args.max_iterations:
+            print(f"\n   Reached max iterations ({args.max_iterations}). Stopping.")
+            break
+        
         iteration += 1
+        max_iter_str = f"/{args.max_iterations}" if args.max_iterations else ""
         print(f"\n{'=' * 70}")
-        print(f"ITERATION {iteration}/{args.max_iterations}")
+        print(f"ITERATION {iteration}{max_iter_str}")
         print(f"{'=' * 70}")
         
         try:
@@ -551,13 +556,12 @@ def main():
                 print(f"\nSending result to Discord...")
                 send_discord_message(discord_webhook_url, message)
             
-            # Step 7: Check rank and decide whether to continue
+            # Step 7: Report rank and continue
             if estimated_rank <= 60:
-                print(f"\n✓ SUCCESS! Rank {estimated_rank} is <= 60. Stopping workflow.")
+                print(f"\n✓ EXCELLENT! Rank {estimated_rank} is <= 60. Continuing to find even better results...")
                 if discord_webhook_url:
-                    success_msg = f"🎉 SUCCESS! Dataset {dataset_filename} achieved rank {estimated_rank} (loss: {eval_loss:.6f})"
+                    success_msg = f"🎉 EXCELLENT! Dataset {dataset_filename} achieved rank {estimated_rank} (loss: {eval_loss:.6f}). Continuing..."
                     send_discord_message(discord_webhook_url, success_msg)
-                break
             else:
                 print(f"\n⚠️  Rank {estimated_rank} is > 60. Continuing to next iteration...")
                 if discord_webhook_url:

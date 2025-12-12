@@ -295,7 +295,9 @@ def main():
 
     bt.logging.info(f"Using random seed: {lucky_num}")
 
-    # Set up GPU
+    # Set up GPU (same as validator.py)
+    # Note: trainer.py sets deterministic=True when imported, but we override benchmark
+    # to match validator.py behavior
     torch.backends.cudnn.benchmark = True
 
     # Determine base data directory
