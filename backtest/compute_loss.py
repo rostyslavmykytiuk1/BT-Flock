@@ -54,7 +54,7 @@ NUM_RUNS_PER_MINER = 3  # Number of times to compute loss with different seeds
 # UIDs to process - modify this array directly
 UIDS_TO_PROCESS = [
     # Add your UIDs here, e.g.:
-    # 1, 2, 3, 4, 5,
+    19, 154, 190, 147, 9, 206, 221
 ]
 
 
